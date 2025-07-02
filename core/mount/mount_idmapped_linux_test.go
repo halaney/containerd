@@ -135,7 +135,7 @@ func testIDMapMount(t *testing.T) {
 		require.NoError(t, UnmountAll(destDir, 0))
 	}()
 
-	err = IDMapMount(srcDir, destDir, int(usernsFD.Fd()))
+	err = IDMapMountLegacy(srcDir, destDir, int(usernsFD.Fd()))
 	usernsFD.Close()
 	require.NoError(t, err)
 	checkFunc(destDir)

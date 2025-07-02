@@ -61,12 +61,36 @@ func parseIDMapping(mapping string) ([]syscall.SysProcIDMap, error) {
 	}, nil
 }
 
-// IDMapMount applies GID/UID shift according to gidmap/uidmap for target path
-func IDMapMount(source, target string, usernsFd int) (err error) {
+// IDMapMount applies GID/UID shift according to gidmap/uidmap and returns the idmapped file descriptor
+func IDMapMount(source string, usernsFd int) (*os.File, error) {
 	var (
 		attr unix.MountAttr
 	)
 
+	attr.Attr_set = unix.MOUNT_ATTR_IDMAP
+	attr.Attr_clr = 0
+	attr.Propagation = 0
+	attr.Userns_fd = uint64(usernsFd)
+
+	dFd, err := unix.OpenTree(-int(unix.EBADF), source, uint(unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC|unix.AT_EMPTY_PATH))
+	if err != nil {
+		return nil, fmt.Errorf("Unable to open tree for %s: %w", source, err)
+	}
+	if err = unix.MountSetattr(dFd, "", unix.AT_EMPTY_PATH, &attr); err != nil {
+		unix.Close(dFd)
+		return nil, fmt.Errorf("Unable to shift GID/UID for %s: %w", source, err)
+	}
+
+	file := os.NewFile(uintptr(dFd), source)
+	return file, nil
+}
+
+// IDMapMountLegacy applies GID/UID shift according to gidmap/uidmap for target path
+// using the legacy approach with move_mount for usage with older kernels / not overlayfs
+func IDMapMountLegacy(source, target string, usernsFd int) (err error) {
+	var (
+		attr unix.MountAttr
+	)
 	attr.Attr_set = unix.MOUNT_ATTR_IDMAP
 	attr.Attr_clr = 0
 	attr.Propagation = 0

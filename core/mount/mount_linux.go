@@ -22,9 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 
 	"github.com/containerd/log"
@@ -49,33 +47,6 @@ func init() {
 	pagesize = os.Getpagesize()
 }
 
-// prepareIDMappedOverlay is a helper function to obtain
-// actual "lowerdir=..." mount options. It creates and
-// applies id mapping for each lowerdir.
-//
-// It returns:
-//  1. New options that include new "lowedir=..." mount option.
-//  2. "Clean up" function -- it should be called as a defer one before
-//     checking for error, because if do the second and avoid calling "clean up",
-//     you're going to have "dirty" setup -- there's no guarantee that those
-//     temporary mount points for lowedirs will be cleaned properly.
-//  3. Error -- nil if everything's fine, otherwise an error.
-func prepareIDMappedOverlay(usernsFd int, options []string) ([]string, func(), error) {
-	lowerIdx, lowerDirs := findOverlayLowerdirs(options)
-	if lowerIdx == -1 {
-		return options, nil, fmt.Errorf("failed to parse overlay lowerdir's from given options")
-	}
-
-	tmpLowerdirs, idMapCleanUp, err := doPrepareIDMappedOverlay(lowerDirs, usernsFd)
-	if err != nil {
-		return options, idMapCleanUp, fmt.Errorf("failed to create idmapped mount: %w", err)
-	}
-
-	options = append(options[:lowerIdx], options[lowerIdx+1:]...)
-	options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(tmpLowerdirs, ":")))
-
-	return options, idMapCleanUp, nil
-}
 
 // Mount to the provided target path.
 //
@@ -106,22 +77,38 @@ func (m *Mount) mount(target string) (err error) {
 
 		// overlay expects lowerdir's to be remapped instead
 		if m.Type == "overlay" {
-			var (
-				userNsCleanUp func()
-			)
-			options, userNsCleanUp, err = prepareIDMappedOverlay(int(usernsFd.Fd()), options)
+			log.L.Debugf("mount: handling overlay filesystem with idmapping for target=%s", target)
+			log.L.Debugf("mount: original options: %v", options)
+			
+			lowerIdx, lowerDirs := findOverlayLowerdirs(options)
+			if lowerIdx == -1 {
+				log.L.Errorf("mount: failed to parse overlay lowerdirs from options: %v", options)
+				return fmt.Errorf("failed to parse overlay lowerdirs from given options")
+			}
+			log.L.Debugf("mount: found lowerdirs at index %d: %v", lowerIdx, lowerDirs)
+			
+			idmappedDirs, userNsCleanUp, err := doPrepareIDMappedOverlay(lowerDirs, int(usernsFd.Fd()))
 			defer userNsCleanUp()
 
 			if err != nil {
+				log.L.Errorf("mount: failed to prepare idmapped overlay: %v", err)
 				return fmt.Errorf("failed to prepare idmapped overlay: %w", err)
 			}
-			// To not meet concurrency issues while using the same lowedirs
-			// for different containers, replace them by temporary directories,
-			if optionsSize(options) >= pagesize-512 {
-				recalcOpt = true
-			} else {
-				opt = parseMountOptions(options)
+			
+			// Remove lowerdir from options, we'll handle it via fsconfig as an fd
+			// and leave the rest for fsconfig string options
+			log.L.Debugf("mount: removing lowerdir option from index %d, remaining options will be: %v", lowerIdx, append(options[:lowerIdx], options[lowerIdx+1:]...))
+			options = append(options[:lowerIdx], options[lowerIdx+1:]...)
+			opt = parseMountOptions(options)
+			log.L.Debugf("mount: parsed mount options after removing lowerdir: flags=0x%x, data=%v", opt.flags, opt.data)
+			
+			log.L.Debugf("mount: calling mountAtWithIDMapping for overlay mount")
+			if err := mountAtWithIDMapping(m.Source, target, m.Type, uintptr(opt.flags), strings.Join(opt.data, ","), idmappedDirs); err != nil {
+				log.L.Errorf("mount: mountAtWithIDMapping failed: %v", err)
+				return err
 			}
+			log.L.Debugf("mount: overlay idmapped mount completed successfully")
+			return nil
 		}
 	}
 
@@ -206,10 +193,11 @@ func (m *Mount) mount(target string) (err error) {
 
 	// remap non-overlay mount point
 	if opt.uidmap != "" && opt.gidmap != "" && m.Type != "overlay" {
-		if err := IDMapMount(target, target, int(usernsFd.Fd())); err != nil {
+		if err := IDMapMountLegacy(target, target, int(usernsFd.Fd())); err != nil {
 			return err
 		}
 	}
+	
 	return nil
 }
 
@@ -244,43 +232,45 @@ func getUnprivilegedMountFlags(path string) (int, error) {
 	return flags, nil
 }
 
-func doPrepareIDMappedOverlay(lowerDirs []string, usernsFd int) (tmpLowerDirs []string, _ func(), _ error) {
-	td, err := os.MkdirTemp(tempMountLocation, "ovl-idmapped")
-	if err != nil {
-		return nil, nil, err
+// idmappedLowerDirs holds file descriptors for idmapped lowerdirs and a mapping to
+// the original lowerdir path for debugging / logging
+type idmappedLowerDirs struct {
+	lowerFds []*os.File
+	lowerDirs []string
+}
+
+func (i *idmappedLowerDirs) Close() {
+	for _, fd := range i.lowerFds {
+		if fd != nil {
+			fd.Close()
+		}
 	}
+}
+
+func doPrepareIDMappedOverlay(lowerDirs []string, usernsFd int) (*idmappedLowerDirs, func(), error) {
+	idmappedDirs := &idmappedLowerDirs{
+		lowerFds: make([]*os.File, 0, len(lowerDirs)),
+		lowerDirs: lowerDirs,
+	}
+	
 	cleanUp := func() {
-		for _, lowerDir := range tmpLowerDirs {
-			// Do a detached unmount so even if the resource is busy, the mount will be
-			// gone (eventually) and we can safely delete the directory too.
-			if err := unix.Unmount(lowerDir, unix.MNT_DETACH); err != nil {
-				log.L.WithError(err).Warnf("failed to unmount temp lowerdir %s", lowerDir)
-				continue
-			}
-			// Using os.Remove() so if it's not empty, we don't delete files in the
-			// rootfs.
-			if err := os.Remove(lowerDir); err != nil {
-				log.L.WithError(err).Warnf("failed to remove temporary overlay lowerdir's")
-			}
-		}
-
-		// This dir should be empty now. Otherwise, we don't do anything.
-		if err := os.Remove(filepath.Join(tmpLowerDirs[0], "..")); err != nil {
-			log.L.WithError(err).Infof("failed to remove temporary overlay dir")
-		}
+		log.L.Debugf("doPrepareIDMappedOverlay: cleaning up %d idmapped fds", len(idmappedDirs.lowerFds))
+		idmappedDirs.Close()
 	}
+	
 	for i, lowerDir := range lowerDirs {
-		tmpLowerDir := filepath.Join(td, strconv.Itoa(i))
-		tmpLowerDirs = append(tmpLowerDirs, tmpLowerDir)
-
-		if err = os.MkdirAll(tmpLowerDir, 0700); err != nil {
-			return nil, cleanUp, fmt.Errorf("failed to create temporary dir: %w", err)
+		log.L.Debugf("doPrepareIDMappedOverlay: creating idmapped fd for lowerDir[%d]=%s", i, lowerDir)
+		idmappedFd, err := IDMapMount(lowerDir, usernsFd)
+		if err != nil {
+			log.L.Errorf("doPrepareIDMappedOverlay: failed to create idmapped mount for %s: %v", lowerDir, err)
+			return nil, cleanUp, fmt.Errorf("failed to create idmapped mount for %s: %w", lowerDir, err)
 		}
-		if err = IDMapMount(lowerDir, tmpLowerDir, usernsFd); err != nil {
-			return nil, cleanUp, err
-		}
+		log.L.Debugf("doPrepareIDMappedOverlay: successfully created idmapped fd=%d for %s", idmappedFd.Fd(), lowerDir)
+		idmappedDirs.lowerFds = append(idmappedDirs.lowerFds, idmappedFd)
 	}
-	return tmpLowerDirs, cleanUp, nil
+	
+	log.L.Debugf("doPrepareIDMappedOverlay: successfully prepared all %d idmapped lowerdirs", len(lowerDirs))
+	return idmappedDirs, cleanUp, nil
 }
 
 // parseMountOptions takes fstab style mount options and parses them for
@@ -454,6 +444,103 @@ func optionsSize(opts []string) int {
 		size += len(opt)
 	}
 	return size
+}
+
+// mountAtWithIDMapping creates an overlay mount using fscreate/fsconfig with idmapped lowerdirs
+// We can skip some of the page size processing stuff in the future if we go this route since
+// that's all about not going over PAGE_SIZE when using the traditional mount() vs fsconfig() calls
+func mountAtWithIDMapping(source, target, fstype string, flags uintptr, data string, idmappedDirs *idmappedLowerDirs) error {
+	log.L.Debugf("mountAtWithIDMapping: creating %s mount from %s to %s with %d idmapped lowerdirs", fstype, source, target, len(idmappedDirs.lowerFds))
+	log.L.Debugf("mountAtWithIDMapping: flags=0x%x, data=%s", flags, data)
+	
+	log.L.Debugf("mountAtWithIDMapping: calling Fsopen for %s", fstype)
+	fsfd, err := unix.Fsopen(fstype, unix.FSOPEN_CLOEXEC)
+	if err != nil {
+		log.L.Errorf("mountAtWithIDMapping: Fsopen failed for %s: %v", fstype, err)
+		return fmt.Errorf("failed to create %s filesystem context: %w", fstype, err)
+	}
+	log.L.Debugf("mountAtWithIDMapping: Fsopen successful, fsfd=%d", fsfd)
+	defer unix.Close(fsfd)
+
+	log.L.Debugf("mountAtWithIDMapping: configuring %d idmapped lowerdirs", len(idmappedDirs.lowerFds))
+	for i, lowerFd := range idmappedDirs.lowerFds {
+		log.L.Debugf("mountAtWithIDMapping: configuring lowerdir[%d] with fd=%d (original: %s)", i, lowerFd.Fd(), idmappedDirs.lowerDirs[i])
+		if err = unix.FsconfigSetFd(fsfd, "lowerdir+", int(lowerFd.Fd())); err != nil {
+			log.L.Errorf("mountAtWithIDMapping: FsconfigSetFd failed for lowerdir[%d] fd=%d: %v", i, lowerFd.Fd(), err)
+			return fmt.Errorf("failed to configure idmapped lowerdir: %w", err)
+		}
+		log.L.Debugf("mountAtWithIDMapping: successfully configured lowerdir[%d]", i)
+	}
+
+	// Deal with the rest of the options
+	if data != "" {
+		log.L.Debugf("mountAtWithIDMapping: configuring additional options: %s", data)
+		opts := strings.Split(data, ",")
+		for _, opt := range opts {
+			if opt == "" {
+				continue
+			}
+			log.L.Debugf("mountAtWithIDMapping: processing option: %s", opt)
+			if strings.Contains(opt, "=") {
+				parts := strings.SplitN(opt, "=", 2)
+				log.L.Debugf("mountAtWithIDMapping: setting string option %s=%s", parts[0], parts[1])
+				if err = unix.FsconfigSetString(fsfd, parts[0], parts[1]); err != nil {
+					log.L.Errorf("mountAtWithIDMapping: FsconfigSetString failed for %s=%s: %v", parts[0], parts[1], err)
+					return fmt.Errorf("failed to configure option %s: %w", opt, err)
+				}
+			} else {
+				log.L.Debugf("mountAtWithIDMapping: setting flag option %s", opt)
+				if err = unix.FsconfigSetFlag(fsfd, opt); err != nil {
+					log.L.Errorf("mountAtWithIDMapping: FsconfigSetFlag failed for %s: %v", opt, err)
+					return fmt.Errorf("failed to configure flag %s: %w", opt, err)
+				}
+			}
+			log.L.Debugf("mountAtWithIDMapping: successfully configured option: %s", opt)
+		}
+	} else {
+		log.L.Debugf("mountAtWithIDMapping: no additional options to configure")
+	}
+
+	log.L.Debugf("mountAtWithIDMapping: calling FsconfigCreate to create %s filesystem", fstype)
+	if err = unix.FsconfigCreate(fsfd); err != nil {
+		log.L.Errorf("mountAtWithIDMapping: FsconfigCreate failed: %v", err)
+		return fmt.Errorf("failed to create %s filesystem: %w", fstype, err)
+	}
+	log.L.Debugf("mountAtWithIDMapping: filesystem created successfully")
+
+	log.L.Debugf("mountAtWithIDMapping: calling Fsmount to create mount fd")
+	mntfd, err := unix.Fsmount(fsfd, unix.FSMOUNT_CLOEXEC, 0)
+	if err != nil {
+		log.L.Errorf("mountAtWithIDMapping: Fsmount failed: %v", err)
+		return fmt.Errorf("failed to create mount fd: %w", err)
+	}
+	log.L.Debugf("mountAtWithIDMapping: Fsmount successful, mntfd=%d", mntfd)
+	defer unix.Close(mntfd)
+
+	// TODO: remove this paranoia if it we can expect the dir to always exist by this point?
+	if _, err := os.Stat(target); err != nil {
+		if os.IsNotExist(err) {
+			log.L.Debugf("mountAtWithIDMapping: target directory %s does not exist, creating it", target)
+			if err = os.MkdirAll(target, 0755); err != nil {
+				log.L.Errorf("mountAtWithIDMapping: failed to create target directory %s: %v", target, err)
+				return fmt.Errorf("failed to create target directory %s: %w", target, err)
+			}
+		} else {
+			log.L.Errorf("mountAtWithIDMapping: failed to stat target directory %s: %v", target, err)
+			return fmt.Errorf("failed to stat target directory %s: %w", target, err)
+		}
+	}
+	
+	log.L.Debugf("mountAtWithIDMapping: calling MoveMount to attach mount to %s", target)
+	if err = unix.MoveMount(mntfd, "", unix.AT_FDCWD, target, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
+		log.L.Errorf("mountAtWithIDMapping: MoveMount failed: %v", err)
+		log.L.Debugf("mountAtWithIDMapping: MoveMount parameters: mntfd=%d, from_pathname='', to_dirfd=%d, to_pathname='%s', flags=%d", 
+			mntfd, unix.AT_FDCWD, target, unix.MOVE_MOUNT_F_EMPTY_PATH)
+		return fmt.Errorf("failed to attach %s to %s: %w", fstype, target, err)
+	}
+	log.L.Debugf("mountAtWithIDMapping: MoveMount successful, %s mount completed at %s", fstype, target)
+
+	return nil
 }
 
 func mountAt(chdir string, source, target, fstype string, flags uintptr, data string) error {

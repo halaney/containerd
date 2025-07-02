@@ -261,7 +261,7 @@ func SupportsIDMappedMounts() (bool, error) {
 	}
 	defer usernsFd.Close()
 
-	if err = mount.IDMapMount(lowerDir, lowerDir, int(usernsFd.Fd())); err != nil {
+	if err = mount.IDMapMountLegacy(lowerDir, lowerDir, int(usernsFd.Fd())); err != nil {
 		return false, fmt.Errorf("failed to remap lowerdir %s: %w", lowerDir, err)
 	}
 	defer func() {
